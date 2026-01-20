@@ -1,0 +1,122 @@
+---
+# MySQL Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mysql
+spec:
+  selector:
+    matchLabels:
+      app: mysql
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: mysql
+      annotations:
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/role: "vault-role"
+        vault.hashicorp.com/agent-inject-secret-mysql_root_password: "secret/mysql"
+        vault.hashicorp.com/agent-inject-template-mysql_root_password: |
+          {{- with secret "secret/mysql" -}}
+          {{ .Data.data.MYSQL_ROOT_PASSWORD }}
+          {{- end -}}
+        vault.hashicorp.com/agent-inject-secret-mysql_database: "secret/mysql"
+        vault.hashicorp.com/agent-inject-template-mysql_database: |
+          {{- with secret "secret/mysql" -}}
+          {{ .Data.data.MYSQL_DATABASE }}
+          {{- end -}}
+    spec:
+      serviceAccountName: vault-auth
+      containers:
+      - image: mysql:8
+        name: mysql
+        env:
+        - name: MYSQL_ROOT_PASSWORD_FILE
+          value: "/vault/secrets/mysql_root_password"
+        - name: MYSQL_DATABASE_FILE
+          value: "/vault/secrets/mysql_database"
+        ports:
+        - containerPort: 3306
+          name: mysql
+        volumeMounts:
+        - name: mysql-storage
+          mountPath: /var/lib/mysql
+      volumes:
+      - name: mysql-storage
+        persistentVolumeClaim:
+          claimName: mysql-pvc
+---
+# MySQL Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-service
+spec:
+  ports:
+  - port: 3306
+  selector:
+    app: mysql
+---
+# Java Application Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bankapp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: bankapp
+  template:
+    metadata:
+      labels:
+        app: bankapp
+      annotations:
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/role: "vault-role"
+        vault.hashicorp.com/agent-inject-secret-SPRING_DATASOURCE_PASSWORD: "secret/mysql"
+        vault.hashicorp.com/agent-inject-template-SPRING_DATASOURCE_PASSWORD: |
+          {{- with secret "secret/mysql" -}}
+          {{ .Data.data.MYSQL_ROOT_PASSWORD }}
+          {{- end -}}
+    spec:
+      serviceAccountName: vault-auth
+      initContainers:
+      - name: wait-for-mysql
+        image: busybox:1.28
+        command:
+          - 'sh'
+          - '-c'
+          - |
+            until nc -zv mysql-service 3306; do
+              echo "Waiting for MySQL to start..."
+              sleep 2
+            done
+            echo "MySQL is up and running!"
+      containers:
+      - name: bankapp
+        image: abishekbhs/bankapp:v17
+        ports:
+        - containerPort: 8080
+        env:
+        - name: SPRING_DATASOURCE_URL
+          value: jdbc:mysql://mysql-service:3306/bankappdb?useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true
+        - name: SPRING_DATASOURCE_USERNAME
+          value: root
+        - name: SPRING_DATASOURCE_PASSWORD_FILE
+          value: "/vault/secrets/spring_datasource_password"
+---
+# Bank Application Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: bankapp-service
+spec:
+  type: LoadBalancer
+  ports:
+  - port: 80
+    targetPort: 8080
+  selector:
+    app: bankapp
